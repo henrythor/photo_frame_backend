@@ -1,0 +1,353 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/awslabs/goformation/master/schema/sam.schema.json
+# yaml-language-server: customTags: [!Ref, !Sub, !GetAtt, !If, !Equals]
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Photo Frame Backend - processes and serves images for e-ink display
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+
+  EnableCustomDomain:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: |
+      Set to "true" to enable custom domain (api.yourdomain.com).
+      Set to "false" to use the default API Gateway URL.
+      When false, DomainName/HostedZoneName/HostedZoneId are ignored.
+
+  DomainName:
+    Type: String
+    Default: api.example.com
+    Description: Custom domain name for the API (e.g., api.yourdomain.com)
+
+  HostedZoneName:
+    Type: String
+    Default: example.com.
+    Description: |
+      Route 53 hosted zone name (must end with a dot).
+      SAM will automatically look up the hosted zone ID for Route53 alias records.
+      Example: "yourdomain.com." for api.yourdomain.com
+
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: |
+      Route 53 hosted zone ID (required for ACM certificate DNS validation).
+      Find this in Route 53 console or via: aws route53 list-hosted-zones
+      Example: Z1234567890ABC
+
+Conditions:
+  UseCustomDomain: !Equals [!Ref EnableCustomDomain, "true"]
+
+Resources:
+  PhotoBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub photo-frame-${Environment}-${AWS::AccountId}
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteInputAfterProcessing
+            Status: Enabled
+            Prefix: input/
+            ExpirationInDays: 1
+          - Id: MoveOriginalsToIA
+            Status: Enabled
+            Prefix: originals/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  PhotoTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub photo-frame-images-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: image_id
+          AttributeType: S
+        - AttributeName: content_hash
+          AttributeType: S
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: random_sort
+          AttributeType: N
+      KeySchema:
+        - AttributeName: image_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ContentHashIndex
+          KeySchema:
+            - AttributeName: content_hash
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+        - IndexName: RandomSortIndex
+          KeySchema:
+            - AttributeName: pk
+              KeyType: HASH
+            - AttributeName: random_sort
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ProcessImageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub photo-frame-process-${Environment}
+      CodeUri: src/process_image/
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref PhotoBucket
+          TABLE_NAME: !Ref PhotoTable
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref PhotoBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotoTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - rekognition:DetectFaces
+              Resource: '*'
+      Events:
+        S3Event:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref PhotoBucket
+                object:
+                  key:
+                    - prefix: input/
+
+  ApiCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: UseCustomDomain
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/api-gateway/photo-frame-${Environment}
+      RetentionInDays: 90
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  PhotoFrameApi:
+    Type: AWS::Serverless::Api
+    DependsOn: ApiGatewayAccount
+    Properties:
+      Name: !Sub photo-frame-api-${Environment}
+      StageName: prod
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","errorMessage":"$context.error.message"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: !Sub photo-frame-usage-plan-${Environment}
+          Throttle:
+            RateLimit: 10
+            BurstLimit: 20
+          Quota:
+            Limit: 5000
+            Period: MONTH
+      Domain:
+        DomainName: !Ref DomainName
+        CertificateArn: !If
+          - UseCustomDomain
+          - !Ref ApiCertificate
+          - !Ref AWS::NoValue
+        EndpointConfiguration: REGIONAL
+        Route53:
+          HostedZoneName: !Ref HostedZoneName
+        BasePath:
+          - v1
+
+  UploadApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub photo-frame-upload-key-${Environment}
+      Enabled: true
+
+  DisplayApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub photo-frame-display-key-${Environment}
+      Enabled: true
+
+  UploadApiKeyUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref UploadApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref PhotoFrameApiUsagePlan
+
+  DisplayApiKeyUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref DisplayApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref PhotoFrameApiUsagePlan
+
+  GetUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub photo-frame-get-upload-url-${Environment}
+      CodeUri: src/get_upload_url/
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref PhotoBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref PhotoBucket
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PhotoFrameApi
+            Path: /photo-frame/upload-url
+            Method: GET
+            Auth:
+              ApiKeyRequired: true
+
+  GetRandomImageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub photo-frame-get-random-image-${Environment}
+      CodeUri: src/get_random_image/
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref PhotoBucket
+          TABLE_NAME: !Ref PhotoTable
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref PhotoBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotoTable
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PhotoFrameApi
+            Path: /photo-frame/image
+            Method: GET
+            Auth:
+              ApiKeyRequired: true
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${PhotoFrameApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+
+  CustomDomainUrl:
+    Condition: UseCustomDomain
+    Description: Custom domain API URL
+    Value: !Sub https://${DomainName}/v1
+
+  UploadEndpoint:
+    Description: Full upload URL endpoint
+    Value: !If
+      - UseCustomDomain
+      - !Sub https://${DomainName}/v1/photo-frame/upload-url
+      - !Sub https://${PhotoFrameApi}.execute-api.${AWS::Region}.amazonaws.com/prod/photo-frame/upload-url
+
+  ImageEndpoint:
+    Description: Full get image endpoint
+    Value: !If
+      - UseCustomDomain
+      - !Sub https://${DomainName}/v1/photo-frame/image
+      - !Sub https://${PhotoFrameApi}.execute-api.${AWS::Region}.amazonaws.com/prod/photo-frame/image
+
+  BucketName:
+    Description: S3 bucket name
+    Value: !Ref PhotoBucket
+
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref PhotoTable
+
+  UploadApiKeyId:
+    Description: Upload API Key ID (retrieve value with aws apigateway get-api-key)
+    Value: !Ref UploadApiKey
+
+  DisplayApiKeyId:
+    Description: Display API Key ID (retrieve value with aws apigateway get-api-key)
+    Value: !Ref DisplayApiKey

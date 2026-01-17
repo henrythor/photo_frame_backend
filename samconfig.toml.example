@@ -1,0 +1,34 @@
+# samconfig.toml.example
+# Copy this to samconfig.toml and customize for your deployment
+#
+# QUICK START (no custom domain):
+#   Just set EnableCustomDomain=false and deploy!
+#
+# WITH CUSTOM DOMAIN:
+#   1. Set EnableCustomDomain=true
+#   2. Set DomainName to your API subdomain (e.g., api.example.com)
+#   3. Set HostedZoneName to your domain with trailing dot (e.g., example.com.)
+#   4. Find your HostedZoneId:
+#      aws route53 list-hosted-zones --query "HostedZones[?Name=='example.com.'].Id"
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "photo-frame-backend"
+resolve_s3 = true
+s3_prefix = "photo-frame-backend"
+region = "eu-west-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+
+parameter_overrides = [
+    "Environment=dev",
+    "EnableCustomDomain=false"
+    # Uncomment and customize if EnableCustomDomain=true:
+    # "DomainName=api.example.com",
+    # "HostedZoneName=example.com.",
+    # "HostedZoneId=YOUR_HOSTED_ZONE_ID"
+]
+
+[default.build.parameters]
+use_container = true

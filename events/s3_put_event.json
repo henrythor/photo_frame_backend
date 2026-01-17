@@ -1,0 +1,18 @@
+{
+  "version": "0",
+  "id": "example-id",
+  "detail-type": "Object Created",
+  "source": "aws.s3",
+  "account": "123456789012",
+  "time": "2024-01-15T12:00:00Z",
+  "region": "eu-west-1",
+  "detail": {
+    "bucket": {
+      "name": "photo-frame-dev-123456789012"
+    },
+    "object": {
+      "key": "input/test-image.jpg",
+      "size": 1024000
+    }
+  }
+}
